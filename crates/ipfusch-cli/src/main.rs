@@ -355,9 +355,7 @@ async fn run_with_progress(cfg: RunConfig, no_color: bool) -> Result<RunReport> 
         humantime::format_duration(cfg.duration),
         humantime::format_duration(cfg.warmup),
     ));
-    bar.println(
-        "interval    transfer-rate    packet-rate      loss        p99-latency".to_string(),
-    );
+    bar.println("interval    transfer-rate    packet-rate      loss        p99-latency");
 
     let start = Instant::now();
     let (tx, mut rx) = mpsc::unbounded_channel::<IntervalStats>();

@@ -38,6 +38,17 @@ struct Totals {
     bytes: u64,
 }
 
+struct IntervalBuildInput<'a> {
+    idx: u64,
+    interval: Duration,
+    totals: &'a Totals,
+    prev: &'a Totals,
+    interval_latencies: &'a [f64],
+    interval_jitters: &'a [f64],
+    measurement_start: Instant,
+    now: Instant,
+}
+
 pub async fn run_benchmark(
     cfg: RunConfig,
     progress_tx: Option<mpsc::UnboundedSender<IntervalStats>>,
@@ -112,16 +123,16 @@ pub async fn run_benchmark(
                     continue;
                 }
 
-                let interval = build_interval(
-                    interval_idx,
-                    cfg.interval,
-                    &totals,
-                    &totals_prev,
-                    &interval_latencies,
-                    &interval_jitters,
+                let interval = build_interval(IntervalBuildInput {
+                    idx: interval_idx,
+                    interval: cfg.interval,
+                    totals: &totals,
+                    prev: &totals_prev,
+                    interval_latencies: &interval_latencies,
+                    interval_jitters: &interval_jitters,
                     measurement_start,
                     now,
-                );
+                });
                 totals_prev = totals.clone();
                 interval_latencies.clear();
                 interval_jitters.clear();
@@ -282,22 +293,22 @@ fn apply_event(
     }
 }
 
-fn build_interval(
-    idx: u64,
-    interval: Duration,
-    totals: &Totals,
-    prev: &Totals,
-    interval_latencies: &[f64],
-    interval_jitters: &[f64],
-    measurement_start: Instant,
-    now: Instant,
-) -> IntervalStats {
-    let bytes = totals.bytes.saturating_sub(prev.bytes);
-    let packets_sent = totals.packets_sent.saturating_sub(prev.packets_sent);
-    let packets_acked = totals.packets_acked.saturating_sub(prev.packets_acked);
-    let packets_lost = totals.packets_lost.saturating_sub(prev.packets_lost);
+fn build_interval(input: IntervalBuildInput<'_>) -> IntervalStats {
+    let bytes = input.totals.bytes.saturating_sub(input.prev.bytes);
+    let packets_sent = input
+        .totals
+        .packets_sent
+        .saturating_sub(input.prev.packets_sent);
+    let packets_acked = input
+        .totals
+        .packets_acked
+        .saturating_sub(input.prev.packets_acked);
+    let packets_lost = input
+        .totals
+        .packets_lost
+        .saturating_sub(input.prev.packets_lost);
 
-    let secs = interval.as_secs_f64().max(0.000_001);
+    let secs = input.interval.as_secs_f64().max(0.000_001);
     let throughput_bps = (bytes as f64 * 8.0) / secs;
     let packet_rate_pps = packets_sent as f64 / secs;
     let loss_pct = if packets_sent == 0 {
@@ -307,12 +318,16 @@ fn build_interval(
     };
 
     IntervalStats {
-        index: idx,
-        start_ms: now
-            .saturating_duration_since(measurement_start)
-            .saturating_sub(interval)
+        index: input.idx,
+        start_ms: input
+            .now
+            .saturating_duration_since(input.measurement_start)
+            .saturating_sub(input.interval)
             .as_millis() as u64,
-        end_ms: now.saturating_duration_since(measurement_start).as_millis() as u64,
+        end_ms: input
+            .now
+            .saturating_duration_since(input.measurement_start)
+            .as_millis() as u64,
         bytes,
         packets_sent,
         packets_acked,
@@ -320,10 +335,10 @@ fn build_interval(
         throughput_bps,
         packet_rate_pps,
         loss_pct,
-        jitter_ms: mean(interval_jitters),
-        p50_ms: quantile(interval_latencies, 0.50),
-        p95_ms: quantile(interval_latencies, 0.95),
-        p99_ms: quantile(interval_latencies, 0.99),
+        jitter_ms: mean(input.interval_jitters),
+        p50_ms: quantile(input.interval_latencies, 0.50),
+        p95_ms: quantile(input.interval_latencies, 0.95),
+        p99_ms: quantile(input.interval_latencies, 0.99),
     }
 }
 
