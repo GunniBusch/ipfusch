@@ -1,5 +1,6 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ipfusch_core::protocol::DataHeader;
+use std::hint::black_box;
 
 fn bench_header_codec(c: &mut Criterion) {
     c.bench_function("data_header_encode_decode", |b| {

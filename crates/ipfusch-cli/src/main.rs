@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Generator, Shell};
+use indicatif::{ProgressBar, ProgressStyle};
 use ipfusch_core::config::{
     RateMode, RunConfig, ServerConfig, ServerTransport, SweepConfig, SweepObjective, Transport,
 };
-use ipfusch_core::report::{RunReport, StreamStats};
+use ipfusch_core::report::{IntervalStats, RunReport, StreamStats};
 use ipfusch_engine::{SweepResult, run_benchmark, run_sweep};
 use std::io;
 use std::net::SocketAddr;
@@ -12,6 +13,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -236,8 +238,10 @@ async fn main() -> Result<()> {
                 let report = run_benchmark(cfg, Some(tx)).await?;
                 printer.await.context("join jsonl task")?;
                 report
-            } else {
+            } else if cli.json {
                 run_benchmark(cfg, None).await?
+            } else {
+                run_with_progress(cfg, cli.no_color).await?
             };
 
             if let Some(path) = args.output {
@@ -320,6 +324,93 @@ fn emit_report(report: &RunReport, as_json: bool) {
         println!("recommendations:");
         for rec in &report.recommendations {
             println!("  - {} (score {:.3}): {}", rec.label, rec.score, rec.reason);
+        }
+    }
+}
+
+async fn run_with_progress(cfg: RunConfig, no_color: bool) -> Result<RunReport> {
+    let measured_total_ms = cfg.duration.as_millis() as u64;
+    let warmup_ms = cfg.warmup.as_millis() as u64;
+    let total_ms = warmup_ms.saturating_add(measured_total_ms).max(1);
+    let refresh = Duration::from_millis(100);
+
+    let style_template = if no_color {
+        "{spinner} [{elapsed_precise}] [{bar:40}] {percent:>3}% {msg}"
+    } else {
+        "{spinner:.cyan} [{elapsed_precise}] [{wide_bar:.blue/white}] {percent:>3}% {msg}"
+    };
+
+    let style = ProgressStyle::with_template(style_template)
+        .context("invalid progress style template")?
+        .progress_chars("█▉▊▋▌▍▎▏ ");
+
+    let bar = ProgressBar::new(total_ms);
+    bar.set_style(style);
+    bar.enable_steady_tick(Duration::from_millis(120));
+    bar.set_message("warming up...");
+    bar.println(format!(
+        "running {} stream(s) over {} for {} (+ {} warmup)",
+        cfg.streams,
+        cfg.transport,
+        humantime::format_duration(cfg.duration),
+        humantime::format_duration(cfg.warmup),
+    ));
+    bar.println(
+        "interval    transfer-rate    packet-rate      loss        p99-latency".to_string(),
+    );
+
+    let start = Instant::now();
+    let (tx, mut rx) = mpsc::unbounded_channel::<IntervalStats>();
+    let mut runner = tokio::spawn(run_benchmark(cfg, Some(tx)));
+    let mut ticker = tokio::time::interval(refresh);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            tick = ticker.tick() => {
+                let _ = tick;
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                let pos = elapsed_ms.min(total_ms);
+                bar.set_position(pos);
+                if elapsed_ms < warmup_ms {
+                    let left = warmup_ms.saturating_sub(elapsed_ms);
+                    bar.set_message(format!("warming up... {}ms", left));
+                }
+            }
+            maybe_interval = rx.recv() => {
+                let Some(interval) = maybe_interval else {
+                    continue;
+                };
+
+                let progress = warmup_ms.saturating_add(interval.end_ms.min(measured_total_ms));
+                bar.set_position(progress.min(total_ms));
+                bar.set_message(format!(
+                    "{:.2} Mbps | {:.2}% loss | p99 {:.2} ms",
+                    interval.throughput_bps / 1_000_000.0,
+                    interval.loss_pct,
+                    interval.p99_ms
+                ));
+                bar.println(format!(
+                    "{:>5.2}-{:>5.2}s  {:>12.2} Mbps  {:>12.2} pps  {:>7.2}%  {:>11.2} ms",
+                    interval.start_ms as f64 / 1000.0,
+                    interval.end_ms as f64 / 1000.0,
+                    interval.throughput_bps / 1_000_000.0,
+                    interval.packet_rate_pps,
+                    interval.loss_pct,
+                    interval.p99_ms,
+                ));
+            }
+            result = &mut runner => {
+                let report = result.context("join benchmark task")??;
+                bar.set_position(total_ms);
+                bar.finish_with_message(format!(
+                    "complete: {:.2} Mbps avg, {:.2}% loss, p99 {:.2} ms",
+                    report.aggregate.throughput_bps / 1_000_000.0,
+                    report.aggregate.loss_pct,
+                    report.aggregate.p99_ms
+                ));
+                return Ok(report);
+            }
         }
     }
 }

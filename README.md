@@ -55,6 +55,8 @@ cargo run -p ipfusch-cli -- run --host 127.0.0.1:5201 --transport udp --streams 
 cargo run -p ipfusch-cli -- run --host 127.0.0.1:5201 --transport quic --tui
 ```
 
+Human-mode runs now show live interval stats and a modern progress/loading bar during execution.
+
 ## Sweep
 
 ```bash
