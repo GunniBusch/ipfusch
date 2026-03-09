@@ -462,7 +462,7 @@ fn print_completion<G: Generator>(generator: G, cmd: &mut clap::Command) {
 
 fn default_payload_size(transport: Transport) -> usize {
     match transport {
-        Transport::Tcp => 16 * 1024,
+        Transport::Tcp => 256 * 1024,
         Transport::Udp | Transport::Quic => 1200,
     }
 }

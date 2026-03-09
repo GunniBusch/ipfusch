@@ -7,8 +7,9 @@ use ipfusch_core::config::Transport;
 use ipfusch_core::protocol::{
     ControlMessage, DATA_HEADER_SIZE, DataHeader, PROTOCOL_VERSION, hash_token,
 };
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
@@ -31,16 +32,72 @@ async fn run_stream_tcp(spec: StreamRunSpec, tx: mpsc::UnboundedSender<PacketEve
 
     control_handshake_tcp(&mut stream, spec.session_id, spec.stream_id, &spec).await?;
 
-    let payload = vec![0u8; spec.payload_bytes];
+    let (mut reader, mut writer) = stream.into_split();
+    let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<(u64, u64)>();
+    let reader_task = tokio::spawn(async move {
+        let mut ack = [0u8; DATA_HEADER_SIZE];
+        while reader.read_exact(&mut ack).await.is_ok() {
+            if let Ok(header) = DataHeader::decode(&ack) {
+                ack_tx.send((header.seq, monotonic_ns())).ok();
+            } else {
+                break;
+            }
+        }
+    });
+
+    let mut frame = vec![0u8; DATA_HEADER_SIZE + spec.payload_bytes];
     let pacing = pacing_delay(spec.payload_bytes, spec.rate_bps);
     let start = Instant::now();
     let warmup_until = start + spec.warmup;
     let end = warmup_until + spec.duration;
+    let drain_deadline = end + spec.timeout;
 
     let mut seq = 0u64;
     let mut next_send = Instant::now();
+    let mut pending = HashMap::<u64, (u64, bool)>::new();
+    let max_inflight = ((4 * 1024 * 1024) / spec.payload_bytes.max(1)).clamp(8, 256);
 
-    while Instant::now() < end {
+    while Instant::now() < end || !pending.is_empty() {
+        while let Ok((ack_seq, recv_mono_ns)) = ack_rx.try_recv() {
+            if let Some((send_mono_ns, measured)) = pending.remove(&ack_seq) {
+                tx.send(PacketEvent {
+                    stream_id: spec.stream_id,
+                    seq: ack_seq,
+                    bytes: spec.payload_bytes as u64,
+                    send_mono_ns,
+                    recv_mono_ns: Some(recv_mono_ns),
+                    measured,
+                })
+                .ok();
+            }
+        }
+
+        if Instant::now() >= end {
+            if Instant::now() >= drain_deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            continue;
+        }
+
+        if pending.len() >= max_inflight {
+            if let Ok(Some((ack_seq, recv_mono_ns))) =
+                tokio::time::timeout(Duration::from_millis(2), ack_rx.recv()).await
+                && let Some((send_mono_ns, measured)) = pending.remove(&ack_seq)
+            {
+                tx.send(PacketEvent {
+                    stream_id: spec.stream_id,
+                    seq: ack_seq,
+                    bytes: spec.payload_bytes as u64,
+                    send_mono_ns,
+                    recv_mono_ns: Some(recv_mono_ns),
+                    measured,
+                })
+                .ok();
+            }
+            continue;
+        }
+
         if let Some(delay) = pacing {
             let now = Instant::now();
             if now < next_send {
@@ -59,39 +116,30 @@ async fn run_stream_tcp(spec: StreamRunSpec, tx: mpsc::UnboundedSender<PacketEve
             send_mono_ns,
             spec.payload_bytes as u32,
         );
-        let mut frame = Vec::with_capacity(DATA_HEADER_SIZE + payload.len());
-        frame.extend_from_slice(&header.encode());
-        frame.extend_from_slice(&payload);
-        stream
+        frame[..DATA_HEADER_SIZE].copy_from_slice(&header.encode());
+        writer
             .write_all(&frame)
             .await
             .context("tcp packet write failed")?;
 
         let measured = Instant::now() >= warmup_until;
-        let mut ack = [0u8; DATA_HEADER_SIZE];
-        let recv_mono_ns =
-            match tokio::time::timeout(spec.timeout, stream.read_exact(&mut ack)).await {
-                Ok(Ok(_)) => {
-                    let ack_header = DataHeader::decode(&ack).context("decode tcp ack header")?;
-                    if ack_header.seq == seq {
-                        Some(monotonic_ns())
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
+        pending.insert(seq, (send_mono_ns, measured));
+    }
 
+    for (lost_seq, (send_mono_ns, measured)) in pending {
         tx.send(PacketEvent {
             stream_id: spec.stream_id,
-            seq,
+            seq: lost_seq,
             bytes: spec.payload_bytes as u64,
             send_mono_ns,
-            recv_mono_ns,
+            recv_mono_ns: None,
             measured,
         })
         .ok();
     }
+
+    writer.shutdown().await.ok();
+    reader_task.abort();
 
     Ok(())
 }
@@ -112,7 +160,7 @@ async fn run_stream_udp(spec: StreamRunSpec, tx: mpsc::UnboundedSender<PacketEve
 
     control_handshake_udp(&socket, &spec).await?;
 
-    let payload = vec![0u8; spec.payload_bytes];
+    let mut frame = vec![0u8; DATA_HEADER_SIZE + spec.payload_bytes];
     let pacing = pacing_delay(spec.payload_bytes, spec.rate_bps);
     let start = Instant::now();
     let warmup_until = start + spec.warmup;
@@ -140,10 +188,7 @@ async fn run_stream_udp(spec: StreamRunSpec, tx: mpsc::UnboundedSender<PacketEve
             send_mono_ns,
             spec.payload_bytes as u32,
         );
-
-        let mut frame = Vec::with_capacity(DATA_HEADER_SIZE + payload.len());
-        frame.extend_from_slice(&header.encode());
-        frame.extend_from_slice(&payload);
+        frame[..DATA_HEADER_SIZE].copy_from_slice(&header.encode());
         socket
             .send(&frame)
             .await
@@ -201,7 +246,7 @@ async fn run_stream_quic(
     let (mut send, mut recv) = conn.open_bi().await.context("open quic stream failed")?;
     control_handshake_quic(&mut send, &mut recv, &spec).await?;
 
-    let payload = vec![0u8; spec.payload_bytes];
+    let mut frame = vec![0u8; DATA_HEADER_SIZE + spec.payload_bytes];
     let pacing = pacing_delay(spec.payload_bytes, spec.rate_bps);
     let start = Instant::now();
     let warmup_until = start + spec.warmup;
@@ -229,9 +274,7 @@ async fn run_stream_quic(
             send_mono_ns,
             spec.payload_bytes as u32,
         );
-        let mut frame = Vec::with_capacity(DATA_HEADER_SIZE + payload.len());
-        frame.extend_from_slice(&header.encode());
-        frame.extend_from_slice(&payload);
+        frame[..DATA_HEADER_SIZE].copy_from_slice(&header.encode());
 
         send.write_all(&frame)
             .await

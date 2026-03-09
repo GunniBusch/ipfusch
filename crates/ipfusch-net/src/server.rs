@@ -111,6 +111,7 @@ async fn handle_tcp_connection(mut socket: TcpStream, token: Option<String>) -> 
     }
 
     let mut header_buf = [0u8; DATA_HEADER_SIZE];
+    let mut payload_buf = Vec::<u8>::new();
     loop {
         if !read_exact_or_eof(&mut socket, &mut header_buf).await? {
             break;
@@ -118,9 +119,12 @@ async fn handle_tcp_connection(mut socket: TcpStream, token: Option<String>) -> 
         let header = DataHeader::decode(&header_buf)?;
 
         if header.payload_len > 0 {
-            let mut payload = vec![0u8; header.payload_len as usize];
+            let required = header.payload_len as usize;
+            if payload_buf.len() < required {
+                payload_buf.resize(required, 0);
+            }
             socket
-                .read_exact(&mut payload)
+                .read_exact(&mut payload_buf[..required])
                 .await
                 .context("read tcp payload")?;
         }
@@ -281,6 +285,7 @@ async fn handle_quic_stream(
     }
 
     let mut header_buf = [0u8; DATA_HEADER_SIZE];
+    let mut payload_buf = Vec::<u8>::new();
     loop {
         if !read_exact_or_eof(recv, &mut header_buf).await? {
             break;
@@ -288,8 +293,11 @@ async fn handle_quic_stream(
 
         let header = DataHeader::decode(&header_buf)?;
         if header.payload_len > 0 {
-            let mut payload = vec![0u8; header.payload_len as usize];
-            recv.read_exact(&mut payload)
+            let required = header.payload_len as usize;
+            if payload_buf.len() < required {
+                payload_buf.resize(required, 0);
+            }
+            recv.read_exact(&mut payload_buf[..required])
                 .await
                 .context("read quic payload")?;
         }

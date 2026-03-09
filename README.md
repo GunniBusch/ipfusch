@@ -83,6 +83,24 @@ cargo test
 
 Integration tests include consistent transport checks for TCP/UDP/QUIC and token-auth validation.
 
+## ipfusch vs iperf3 Benchmarks
+
+Run side-by-side benchmarks with repeated rounds and generated reports:
+
+```bash
+python3 scripts/benchmark-vs-iperf.py --runs 3 --streams 4 --duration 10
+```
+
+Outputs are written to `benchmark-results/<timestamp>/`:
+- `summary.json`: machine-readable performance + precision comparison
+- `summary.md`: human-readable report
+- `raw/`: per-round raw JSON and server logs
+
+The report compares both tools on:
+- throughput performance (mean/median/min/max/stddev)
+- precision and stability (throughput CV, runtime accuracy, interval variability)
+- ipfusch quality metrics (loss, p99 latency, packet rate)
+
 ## CI/CD and Releases
 
 ### CI (`.github/workflows/ci.yml`)

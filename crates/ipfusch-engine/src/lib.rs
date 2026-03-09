@@ -90,6 +90,7 @@ pub async fn run_benchmark(
     let mut totals_prev = Totals::default();
     let mut intervals = Vec::new();
     let mut interval_idx = 0u64;
+    let mut last_interval_tick: Option<Instant> = None;
     let mut interval_latencies = Vec::<f64>::new();
     let mut interval_jitters = Vec::<f64>::new();
     let mut global_latencies = Vec::<f64>::new();
@@ -123,9 +124,21 @@ pub async fn run_benchmark(
                     continue;
                 }
 
+                let interval_span = if let Some(last_tick) = last_interval_tick {
+                    now.saturating_duration_since(last_tick)
+                } else {
+                    now.saturating_duration_since(measurement_start)
+                };
+
+                let effective_span = if interval_span.is_zero() {
+                    cfg.interval
+                } else {
+                    interval_span
+                };
+
                 let interval = build_interval(IntervalBuildInput {
                     idx: interval_idx,
-                    interval: cfg.interval,
+                    interval: effective_span,
                     totals: &totals,
                     prev: &totals_prev,
                     interval_latencies: &interval_latencies,
@@ -134,6 +147,7 @@ pub async fn run_benchmark(
                     now,
                 });
                 totals_prev = totals.clone();
+                last_interval_tick = Some(now);
                 interval_latencies.clear();
                 interval_jitters.clear();
 
@@ -415,24 +429,47 @@ fn build_histogram(latencies_ms: &[f64], histogram: &mut Histogram<u64>) -> Late
 fn resolve_rate(rate: RateMode, transport: Transport) -> (Option<u64>, Vec<Recommendation>) {
     match rate {
         RateMode::Bps(v) => (Some(v), Vec::new()),
-        RateMode::Auto => {
-            let selected = match transport {
-                Transport::Tcp => 5_000_000_000,
-                Transport::Udp => 2_000_000_000,
-                Transport::Quic => 1_000_000_000,
-            };
-            (
-                Some(selected),
-                vec![Recommendation {
-                    label: "auto-rate-selected".to_string(),
-                    score: selected as f64 / 1_000_000_000.0,
-                    reason: format!(
-                        "auto tuner selected {} bps baseline for {}",
-                        selected, transport
-                    ),
-                }],
-            )
-        }
+        RateMode::Auto => match transport {
+            Transport::Tcp => {
+                let selected = 80_000_000_000;
+                (
+                    Some(selected),
+                    vec![Recommendation {
+                        label: "auto-rate-selected".to_string(),
+                        score: selected as f64 / 1_000_000_000.0,
+                        reason: "auto tuner selected high-throughput paced tcp mode".to_string(),
+                    }],
+                )
+            }
+            Transport::Udp => {
+                let selected = 2_000_000_000;
+                (
+                    Some(selected),
+                    vec![Recommendation {
+                        label: "auto-rate-selected".to_string(),
+                        score: selected as f64 / 1_000_000_000.0,
+                        reason: format!(
+                            "auto tuner selected {} bps baseline for {}",
+                            selected, transport
+                        ),
+                    }],
+                )
+            }
+            Transport::Quic => {
+                let selected = 1_000_000_000;
+                (
+                    Some(selected),
+                    vec![Recommendation {
+                        label: "auto-rate-selected".to_string(),
+                        score: selected as f64 / 1_000_000_000.0,
+                        reason: format!(
+                            "auto tuner selected {} bps baseline for {}",
+                            selected, transport
+                        ),
+                    }],
+                )
+            }
+        },
     }
 }
 
@@ -521,6 +558,7 @@ mod tests {
         let (tcp, _) = resolve_rate(RateMode::Auto, Transport::Tcp);
         let (udp, _) = resolve_rate(RateMode::Auto, Transport::Udp);
         let (quic, _) = resolve_rate(RateMode::Auto, Transport::Quic);
-        assert!(tcp > udp && udp > quic);
+        assert!(tcp > udp);
+        assert!(udp > quic);
     }
 }
